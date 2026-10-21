@@ -333,7 +333,7 @@ footer { font-size: 12px; color: var(--muted); }
         <label class="check" id="contribWrap" hidden><input type="checkbox" id="contrib" checked> Share my adjustments anonymously</label>
       </div>
       <div class="hint" id="commHint"></div>
-      <div class="hint" id="adjHint">Drag a player by the ⠿ handle to move him in the rankings, or use − and + to move him 5% at a time. Click the percentage to clear it. Your adjustments apply to trades, rosters and keepers, and are saved in this browser.
+      <div class="hint" id="adjHint">With "My adjustments" selected, drag a player by the ⠿ handle to move him in the rankings, or use − and + to move him 5% at a time. Click the percentage to clear it. Your adjustments apply to trades, rosters and keepers, and are saved in this browser.
       </div>
     </div>
     <div class="rkwrap"><table class="rk" id="rkTable"></table></div>
@@ -435,6 +435,7 @@ footer { font-size: 12px; color: var(--muted); }
         <li>Replacement level at each position is the 2nd best player on your league's waiver wire. Season value is rest-of-season points above that.</li>
         <li>Values run 0 to 1,000, where 1,000 is the most valuable player in your league.</li>
         <li>Keeper value is next year's value (DynastyProcess open data) minus the value of the round he'd cost: 1 round earlier than this season, or the last round if undrafted.</li>
+        <li>Draft picks: next year's order is random, so each pick is worth the average player in its round. Only clear-cut keepers (Strong or Elite value) are assumed off the board, and that is counted at half strength, since teams don't always keep their best players. Picks 2 or more seasons out count at 75%. Picks only count in the Season + keepers view.</li>
         <li>The star premium makes one great player worth more than two good ones. Auto sets it from your league's size.</li>
         <li>Your ranking adjustments scale a player's value by a percentage. When the community database is connected, everyone's adjustments are shared anonymously and the Community view uses the median adjustment for each player.</li>
         <li>Lineup impact rebuilds each team's best starting lineup after the trade, including drops forced by roster limits.</li>
@@ -464,6 +465,10 @@ const STAR_NAMES = { 1: "Off", 1.2: "Light", 1.6: "Strong" };
 const KEEPERS = 3;       // keepers per team
 const SCALE = 1000;      // the league's most valuable player is worth SCALE
 const FORM_WEEKS = 4;    // recent weeks of real stats used for form
+const KEEPER_DRAIN = 0.5;             // how much likely keepers lower pick values (0 = ignore keepers, 1 = full)
+const KEEP_SURE = SCALE * 0.22;       // only Strong or Elite keeper surplus counts as a near-certain keeper
+const FUTURE_DISCOUNT = 0.75;        // picks 2+ seasons out count at 75%
+const ROOKIE_SHARE = 1 / 16;          // next year's rookies take 1 in 16 picks after round 1
 const ADJ_MIN = -0.9, ADJ_MAX = 3;   // your adjustment range: -90% to +300%
 const DP_BASE = "https://raw.githubusercontent.com/dynastyprocess/data/master/files/";
 
@@ -650,14 +655,14 @@ const S = {
   p: 1.35, starMode: "auto", kw: 0.5, fw: 0.25, mode: "season", page: "trade", rkPos: "RB", rkQ: "", rkFA: true, owner: {}, adj: {}, src: "mine", comm: {}, commMeta: null, commScope: "all", contrib: true, dirty: new Set(), leagueId: null, shared: null,
   dp: null, draft: {}, draftCount: 0, rounds: 15, keep: {}, keepReady: false, trend: {}
 };
-const posOf = (pid) => (S.players[pid] ? S.players[pid][1] : null);
-const nameOf = (pid) => (S.players[pid] ? S.players[pid][0] : `Player ${pid}`);
+const posOf = (pid) => (isPick(pid) ? "PICK" : S.players[pid] ? S.players[pid][1] : null);
+const nameOf = (pid) => (isPick(pid) ? pickName(pid) : S.players[pid] ? S.players[pid][0] : `Player ${pid}`);
 const keepBonus = (pid) => { const k = S.keep[pid]; return k && k.ok && k.has ? Math.max(0, k.surplus) : 0; };
 const kwEff = () => (S.keepReady && S.mode === "keep" ? S.kw : 0);
 const commOn = () => !!(COMMUNITY.url && COMMUNITY.key);
 const adjOf = (pid) => S.src === "mine" ? S.adj[pid] || 0 : S.src === "comm" ? (S.comm[pid] ? S.comm[pid].median : 0) : 0;
 const baseOf = (pid) => (S.value[pid] || 0) + kwEff() * keepBonus(pid);   // model value before your adjustment
-const valOf = (pid) => baseOf(pid) * (1 + adjOf(pid));
+const valOf = (pid) => (isPick(pid) ? kwEff() * pickBase(pid) : baseOf(pid) * (1 + adjOf(pid)));
 const ppgOf = (pid) => S.ppg[pid] || 0;
 
 // ---- Loading ----
@@ -757,17 +762,22 @@ async function onLoad(e) {
 }
 
 async function loadLeague(leagueId, state, userId) {
+  S.loadArgs = { leagueId, userId };
+  S.loadedState = { week: state.week, type: state.season_type, season: state.league_season || state.season };
+  S.loadedAt = Date.now();
   store.set("td_league", leagueId);
   S.leagueId = leagueId;
   setStatus("Loading league…");
-  const [league, rosters, users, players, dp, trend] = await Promise.all([
+  const [league, rosters, users, players, dp, trend, traded] = await Promise.all([
     getJSON(`${API}/league/${leagueId}`),
     getJSON(`${API}/league/${leagueId}/rosters`),
     getJSON(`${API}/league/${leagueId}/users`),
     loadPlayers(),
     loadDP().catch(() => null),
-    loadTrending()
+    loadTrending(),
+    getJSON(`${API}/league/${leagueId}/traded_picks`).catch(() => [])
   ]);
+  S.traded = traded || [];
   if (!league) throw new Error("That league wasn't found on Sleeper.");
   S.league = league; S.rosters = rosters || []; S.players = players; S.dp = dp; S.trend = trend;
   S.users = {}; for (const u of users || []) S.users[u.user_id] = u;
@@ -775,16 +785,20 @@ async function loadLeague(leagueId, state, userId) {
   S.maxRoster = (league.roster_positions || []).filter((s) => s !== "IR").length;
   S.scoring = league.scoring_settings || {};
 
-  // This season's drafts: the round each player cost, and whether he was a keeper
+  // The draft that sets keeper costs: this season's, or last season's if this league hasn't drafted yet
+  S.preDraft = ["pre_draft", "drafting"].includes(league.status);
+  const srcLeague = S.preDraft && league.previous_league_id ? league.previous_league_id : leagueId;
   S.draft = {}; S.rounds = 15;
-  const drafts = await getJSON(`${API}/league/${leagueId}/drafts`).catch(() => []);
-  const draftIds = new Set([league.draft_id, ...(drafts || []).filter((d) => !d.season || String(d.season) === String(league.season)).map((d) => d.draft_id)].filter(Boolean));
+  let roundsSet = false;
+  const drafts = await getJSON(`${API}/league/${srcLeague}/drafts`).catch(() => []);
+  const draftIds = new Set([srcLeague === leagueId ? league.draft_id : null,
+    ...(drafts || []).filter((d) => srcLeague !== leagueId || !d.season || String(d.season) === String(league.season)).map((d) => d.draft_id)].filter(Boolean));
   for (const id of draftIds) {
     const [draft, picks] = await Promise.all([
       getJSON(`${API}/draft/${id}`).catch(() => null),
       getJSON(`${API}/draft/${id}/picks`).catch(() => [])
     ]);
-    if (id === league.draft_id && draft && draft.settings && draft.settings.rounds) S.rounds = Number(draft.settings.rounds);
+    if (!roundsSet && draft && draft.settings && draft.settings.rounds) { S.rounds = Number(draft.settings.rounds); roundsSet = true; }
     for (const p of picks || []) {
       const pid = p && (p.player_id || (p.metadata && p.metadata.player_id));
       if (pid && !S.draft[pid]) S.draft[pid] = { round: Number(p.round), keeper: !!p.is_keeper };
@@ -793,17 +807,18 @@ async function loadLeague(leagueId, state, userId) {
   S.draftCount = Object.keys(S.draft).length;
 
   const season = league.season;
-  const live = String(state.league_season || state.season) === String(season);
+  const curSeason = Number(state.league_season || state.season);
   const st = state.season_type;
-  S.fromWeek = live && st === "regular" ? Math.max(1, state.week || 1) : (live && st === "post" ? 99 : 1);
+  // A finished season still matters for keepers and picks, so it loads in keeper-only mode instead of failing
+  S.seasonOver = league.status === "complete" || Number(season) < curSeason || (Number(season) === curSeason && st === "post");
   S.toWeek = seasonEndWeek(league.settings || {});
-  if (S.toWeek < S.fromWeek && S.fromWeek <= 18) S.toWeek = Math.max(17, S.fromWeek);
-  S.weeksLeft = Math.max(0, S.toWeek - S.fromWeek + 1);
-  if (S.weeksLeft === 0) throw new Error("This league's season is over, so there's no rest-of-season value to trade.");
+  S.fromWeek = Number(season) === curSeason && st === "regular" ? Math.max(1, state.week || 1) : 1;
+  if (S.fromWeek > S.toWeek) S.seasonOver = true;
+  S.weeksLeft = S.seasonOver ? 0 : S.toWeek - S.fromWeek + 1;
 
   // Projections for remaining weeks, real stats for the last few
-  const projWeeks = []; for (let w = S.fromWeek; w <= S.toWeek; w++) projWeeks.push(w);
-  const statWeeks = []; for (let w = Math.max(1, S.fromWeek - FORM_WEEKS); w < S.fromWeek; w++) statWeeks.push(w);
+  const projWeeks = []; if (!S.seasonOver) for (let w = S.fromWeek; w <= S.toWeek; w++) projWeeks.push(w);
+  const statWeeks = []; if (!S.seasonOver) for (let w = Math.max(1, S.fromWeek - FORM_WEEKS); w < S.fromWeek; w++) statWeeks.push(w);
   const jobs = projWeeks.map((w) => () => fetchWeek("projections", season, w)).concat(statWeeks.map((w) => () => fetchWeek("stats", season, w)));
   const results = []; let done = 0;
   for (let i = 0; i < jobs.length; i += 4) {
@@ -813,13 +828,15 @@ async function loadLeague(leagueId, state, userId) {
   }
   S.weeksData = results.slice(0, projWeeks.length);
   S.statsWeeks = results.slice(projWeeks.length);
-  if (!S.weeksData.some(Boolean)) throw new Error("Sleeper didn't return any projections for the rest of this season. Try again later.");
+  if (!S.seasonOver && !S.weeksData.some(Boolean)) { S.seasonOver = true; S.noProj = true; S.weeksLeft = 0; }
 
   const mine = userId ? S.rosters.find((r) => r.owner_id === userId || (r.co_owners || []).includes(userId)) : null;
   S.myRosterId = mine ? mine.roster_id : null;
 
   computeValues();
   computeKeepers();
+  buildPicks();
+  if (S.seasonOver && S.keepReady) setMode("keep");
   if (S.starMode === "auto") setStar("auto");
   setupTeams();
   renderLeagueInfo();
@@ -830,10 +847,12 @@ async function loadLeague(leagueId, state, userId) {
   if (commOn()) { loadCommunity(); if (S.contrib) pushAllMine(); }
   $("loadForm").hidden = true; $("pill").hidden = false;
   $("pillName").textContent = league.name;
-  $("pillMeta").textContent = `${league.total_rosters} teams · weeks ${S.fromWeek} to ${S.toWeek}`;
+  $("pillMeta").textContent = `${league.total_rosters} teams · ${S.seasonOver ? "keeper and pick values" : `weeks ${S.fromWeek} to ${S.toWeek}`}`;
   const missing = S.weeksData.filter((x) => !x).length;
   const notes = [];
-  if (missing) notes.push(`${missing} future week(s) had no projections yet and were estimated.`);
+  if (S.seasonOver) notes.push(S.noProj ? "Sleeper has no projections for this season yet, so only keeper and pick values count." : "This league's season is over, so only keeper and pick values count.");
+  if (S.preDraft) notes.push("Keeper costs come from last season's draft.");
+  if (missing && !S.seasonOver) notes.push(`${missing} future week(s) had no projections yet and were estimated.`);
   if (!S.statsWeeks.some(Boolean) && statWeeks.length) notes.push("Recent stats weren't available, so recent form is off.");
   if (!S.dp) notes.push("Keeper data couldn't be loaded, so keeper value is off.");
   else if (!S.draftCount) notes.push("This season's draft wasn't found, so keeper costs treat everyone as undrafted.");
@@ -841,6 +860,7 @@ async function loadLeague(leagueId, state, userId) {
 }
 
 function computeValues() {
+  if (S.seasonOver) { S.form = {}; S.ros = {}; S.repl = {}; S.value = {}; S.ppg = {}; S.posRank = {}; return; }
   const active = {};
   const ros = restOfSeason(S.weeksData, S.scoring, posOf, active);
   S.form = recentForm(S.statsWeeks, S.scoring, posOf);
@@ -875,15 +895,63 @@ function computeKeepers() {
   const raw = {};
   for (const sid in S.dp) raw[sid] = S.dp[sid][sf ? 1 : 0];
   const top = Math.max(1, ...Object.values(raw));
-  const sorted = Object.values(raw).map((v) => (v / top) * SCALE).sort((a, b) => b - a);
-  const rv = roundValues(sorted, S.league.total_rosters || 12, S.rounds);
-  for (const r of S.rosters) for (const pid of [...(r.players || []), ...(r.reserve || []), ...(r.taxi || [])]) {
-    const dp = raw[pid] ? (raw[pid] / top) * SCALE : 0;
-    const cost = keeperCost(S.draft[pid], S.rounds);
-    const ok = cost >= 1;
-    S.keep[pid] = { cost, ok, has: dp > 0, dp, surplus: ok ? dp - rv[cost] : 0 };
-  }
+  const teams = S.league.total_rosters || 12;
+  const scaled = (sid) => (raw[sid] ? (raw[sid] / top) * SCALE : 0);
+  const desc = (a, b) => b - a;
+  const fill = (rv) => {
+    for (const r of S.rosters) for (const pid of [...(r.players || []), ...(r.reserve || []), ...(r.taxi || [])]) {
+      const dp = scaled(pid);
+      const cost = keeperCost(S.draft[pid], S.rounds);
+      const ok = cost >= 1;
+      S.keep[pid] = { cost, ok, has: dp > 0, dp, surplus: ok ? dp - rv[cost] : 0 };
+    }
+  };
+  // Pass 1: every player in the pool.
+  const rvAll = roundValues(Object.keys(raw).map(scaled).sort(desc), teams, S.rounds);
+  fill(rvAll);
+  // Pass 2: only clear-cut keepers (Strong or Elite surplus, up to 3 per team) are assumed off the board,
+  // and that effect is counted at KEEPER_DRAIN, since teams don't always keep their best values.
+  const kept = new Set();
+  for (const r of S.rosters) (r.players || []).filter((x) => keepBonus(x) >= KEEP_SURE).sort((a, b) => keepBonus(b) - keepBonus(a)).slice(0, KEEPERS).forEach((x) => kept.add(x));
+  const rvDrained = roundValues(Object.keys(raw).filter((sid) => !kept.has(sid)).map(scaled).sort(desc), teams, S.rounds);
+  S.rv = rvAll.map((v, i) => (1 - KEEPER_DRAIN) * v + KEEPER_DRAIN * (rvDrained[i] || 0));
+  S.keptOff = kept.size;
+  S.dpRank = {};
+  Object.keys(raw).sort((a, b) => raw[b] - raw[a]).forEach((sid, i) => { S.dpRank[sid] = i + 1; });
+  fill(S.rv);
   S.keepReady = true;
+}
+
+// ---- Draft picks ----
+const isPick = (id) => typeof id === "string" && id.startsWith("pk:");
+function pickParts(id) { const [, season, round, orig] = id.split(":"); return { season: Number(season), round: Number(round), orig }; }
+// Random draft order: every pick in a round is worth that round's average, measured above a last-round pick
+function pickBase(id) {
+  if (!S.rv) return 0;
+  const p = pickParts(id);
+  const v = Math.max(0, (S.rv[p.round] || 0) - (S.rv[S.rounds] || 0));
+  return v * (p.season > S.nextSeason ? FUTURE_DISCOUNT : 1);
+}
+function buildPicks() {
+  S.nextSeason = Number(S.league.season) + (S.preDraft ? 0 : 1);   // the next draft this league will hold
+  const rounds = Number((S.league.settings || {}).draft_rounds) || S.rounds;
+  const seasons = new Set([S.nextSeason]);
+  for (const t of S.traded) if (Number(t.season) >= S.nextSeason) seasons.add(Number(t.season));
+  S.pickOwner = {};
+  for (const season of seasons) for (let round = 1; round <= rounds; round++) for (const r of S.rosters) S.pickOwner[`pk:${season}:${round}:${r.roster_id}`] = r.roster_id;
+  for (const t of S.traded) {
+    const id = `pk:${t.season}:${t.round}:${t.roster_id}`;
+    if (id in S.pickOwner && t.owner_id != null) S.pickOwner[id] = t.owner_id;
+  }
+}
+function teamPicks(rid) {
+  return Object.keys(S.pickOwner || {}).filter((id) => String(S.pickOwner[id]) === String(rid))
+    .sort((a, b) => { const x = pickParts(a), y = pickParts(b); return x.season - y.season || x.round - y.round; });
+}
+function pickName(id) {
+  const p = pickParts(id), owner = S.pickOwner ? S.pickOwner[id] : null;
+  const orig = rosterById(p.orig);
+  return `${p.season} R${p.round}${owner != null && String(owner) !== String(p.orig) && orig ? ` via ${teamName(orig)}` : ""}`;
 }
 
 // ---- Rendering ----
@@ -916,7 +984,7 @@ function renderLeagueInfo() {
     (rec >= 0.95 ? "PPR" : rec >= 0.45 ? "Half PPR" : "Standard") + (sc.bonus_rec_te ? ` · TE +${sc.bonus_rec_te}` : ""),
     S.slots.includes("SUPER_FLEX") ? "Superflex" : `${S.slots.filter((s) => s === "QB").length} QB`,
     `${S.slots.length} starters`,
-    `Weeks ${S.fromWeek} to ${S.toWeek}`
+    S.seasonOver ? "Season over" : `Weeks ${S.fromWeek} to ${S.toWeek}`
   ];
   if (S.keepReady) chips.push(`${KEEPERS} keepers · undrafted = R${S.rounds}`);
   $("leagueChips").innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("");
@@ -952,7 +1020,7 @@ function tags(pid) {
 
 function renderTabs(side, pids) {
   const present = POS_ORDER.filter((pos) => pids.some((x) => posOf(x) === pos));
-  const extra = kwEff() > 0 ? ["Keepers"] : [];
+  const extra = (kwEff() > 0 ? ["Keepers"] : []).concat(teamPicks(sideRoster(side).roster_id).length ? ["Picks"] : []);
   $(`tabs${side}`).innerHTML = ["All", ...present, ...extra].map((t) =>
     `<button type="button" data-side="${side}" data-tab="${t}" aria-pressed="${S.filt[side] === t}">${t}</button>`).join("");
 }
@@ -964,10 +1032,12 @@ function renderRoster(side) {
   const lineup = bestLineup(all, S.slots, ppgOf, posOf);
   const st = r.settings || {};
   $(`m${side}`).textContent = `${st.wins || 0}-${st.losses || 0}${st.ties ? "-" + st.ties : ""} · lineup ${fmt1(lineup.total)}/wk`;
-  if (S.filt[side] === "Keepers" ? kwEff() === 0 : S.filt[side] !== "All" && !all.some((x) => posOf(x) === S.filt[side])) S.filt[side] = "All";
+  const myPicks = teamPicks(r.roster_id);
+  if (S.filt[side] === "Picks" ? !myPicks.length : S.filt[side] === "Keepers" ? kwEff() === 0 : S.filt[side] !== "All" && !all.some((x) => posOf(x) === S.filt[side])) S.filt[side] = "All";
   const kTop = new Set(all.filter((x) => keepBonus(x) > 0).sort((a, b) => keepBonus(b) - keepBonus(a)).slice(0, KEEPERS));
   renderTabs(side, all);
   const q = S.q[side].trim().toLowerCase();
+  if (S.filt[side] === "Picks") { renderPicks(side, r, myPicks, q); return; }
   const keepView = S.filt[side] === "Keepers";
   const shown = all.filter((pid) => (S.filt[side] === "All" || keepView ? (!keepView || (S.keep[pid] && S.keep[pid].has)) : posOf(pid) === S.filt[side]) && (!q || nameOf(pid).toLowerCase().includes(q)));
   const groups = {};
@@ -1001,7 +1071,30 @@ function renderRoster(side) {
   $(`list${side}`).innerHTML = html || `<li class="empty" style="padding:14px">No players match.</li>`;
 }
 
+function renderPicks(side, r, ids, q) {
+  const live = kwEff() > 0;
+  // Which of this team's picks its likely keepers would use up (keepers cost the pick in their round)
+  const keptRounds = {};
+  if (S.keepReady) (r.players || []).filter((x) => keepBonus(x) > 0).sort((x, y) => keepBonus(y) - keepBonus(x)).slice(0, KEEPERS)
+    .forEach((x) => { keptRounds[S.keep[x].cost] = nameOf(x); });
+  let html = `<li class="grp">${!S.keepReady ? "Pick values need the keeper data, which didn't load" : live ? "Random draft order: every pick in a round is worth the same" : "Picks count only in Season + keepers. Adding one switches views."}</li>`;
+  for (const id of ids.filter((x) => !q || nameOf(x).toLowerCase().includes(q))) {
+    const p = pickParts(id), on = S.sel[side].has(id);
+    const own = String(p.orig) === String(r.roster_id);
+    const note = (own ? "Own pick" : `Originally ${esc(teamName(rosterById(p.orig)))}`) + (p.season > S.nextSeason ? ` · counted at ${Math.round(FUTURE_DISCOUNT * 100)}%` : "");
+    const keepTag = p.season === S.nextSeason && keptRounds[p.round] ? `<span class="tags"><span class="tag k-fair" title="Keepers cost the pick in their round">Likely used to keep ${esc(keptRounds[p.round])}</span></span>` : "";
+    const v = S.kw * pickBase(id);
+    html += `<li class="p" role="button" tabindex="0" aria-pressed="${on}" data-side="${side}" data-pid="${id}">
+      <span class="box">${on ? "✓" : ""}</span>
+      <span class="nm"><b>${p.season} Round ${p.round}</b><span class="l2">${note}</span>${keepTag}</span>
+      <span class="val"><b>${fmt0(live ? valOf(id) : v)}</b>${live ? "" : "<small>keepers view</small>"}</span>
+    </li>`;
+  }
+  $(`list${side}`).innerHTML = html;
+}
+
 function lineupImpact(r, sends, gets) {
+  gets = gets.filter((x) => !isPick(x));
   const before = (r.players || []).filter((pid) => S.players[pid]);
   const reserve = new Set([...(r.reserve || []), ...(r.taxi || [])]);
   let after = before.filter((pid) => !sends.includes(pid)).concat(gets);
@@ -1037,7 +1130,7 @@ function renderTrade() {
   const gotB = sideScore(aSends.map(valOf), S.p);
   const pieceList = (ids, side) => ids.length
     ? ids.map((pid) => `<div class="piece"><span class="pn">${esc(nameOf(pid))} <small>${posOf(pid)}</small></span><span class="pv">${fmt0(valOf(pid))}</span><button type="button" class="x" data-side="${side}" data-pid="${pid}" aria-label="Remove ${esc(nameOf(pid))}">×</button></div>`).join("")
-    : `<div class="empty">Pick players from this roster below</div>`;
+    : `<div class="empty">Pick players or picks from this roster below</div>`;
   $("piecesA").innerHTML = pieceList(aSends, "A");
   $("piecesB").innerHTML = pieceList(bSends, "B");
   const sumLine = (ids, counted) => {
@@ -1082,10 +1175,17 @@ function renderTrade() {
   const cell = (i, f, eps, extra) => `<td><span class="${cls(i.after - i.before, eps)}">${signed(i.after - i.before, f)}</span><span class="dl">${f(i.before)} → ${f(i.after)}${extra || ""}</span></td>`;
   const dropNote = (i) => (i.drops.length ? `<br>drops ${i.drops.map((x) => esc(nameOf(x))).join(", ")}` : "");
   let rows = `<thead><tr><th></th><th>${esc(nA)}</th><th>${esc(nB)}</th></tr></thead><tbody>`;
-  rows += `<tr><td>Starting lineup, pts/wk</td>${cell(iA, fmt1, 0.05, dropNote(iA))}${cell(iB, fmt1, 0.05, dropNote(iB))}</tr>`;
+  if (!S.seasonOver) rows += `<tr><td>Starting lineup, pts/wk</td>${cell(iA, fmt1, 0.05, dropNote(iA))}${cell(iB, fmt1, 0.05, dropNote(iB))}</tr>`;
   if (kwEff() > 0) {
     const kA = keeperImpact(rA, aSends, bSends), kB = keeperImpact(rB, bSends, aSends);
     rows += `<tr><td>Best ${KEEPERS} keepers</td>${cell(kA, fmt0, SCALE / 200)}${cell(kB, fmt0, SCALE / 200)}</tr>`;
+    if (aSends.some(isPick) || bSends.some(isPick)) {
+      const pk = (r, sends, gets) => {
+        const own = teamPicks(r.roster_id), sum = (ids) => ids.reduce((a, id) => a + valOf(id), 0);
+        return { before: sum(own), after: sum(own.filter((id) => !sends.includes(id)).concat(gets.filter(isPick))) };
+      };
+      rows += `<tr><td>Draft pick value</td>${cell(pk(rA, aSends, bSends), fmt0, SCALE / 200)}${cell(pk(rB, bSends, aSends), fmt0, SCALE / 200)}</tr>`;
+    }
   }
   $("impact").innerHTML = rows + "</tbody>";
 
@@ -1096,8 +1196,8 @@ function renderTrade() {
     const payerRoster = sideRoster(payer);
     const current = [...S.sel[payer]];
     const target = payer === "A" ? gotA : gotB;
-    const cands = (payerRoster.players || [])
-      .filter((pid) => S.players[pid] && !S.sel[payer].has(pid) && valOf(pid) > 0)
+    const cands = [...(payerRoster.players || []), ...(kwEff() > 0 ? teamPicks(payerRoster.roster_id) : [])]
+      .filter((pid) => (S.players[pid] || isPick(pid)) && !S.sel[payer].has(pid) && valOf(pid) > 0)
       .map((pid) => { const s = sideScore(current.concat(pid).map(valOf), S.p); return { pid, miss: Math.abs(s - target) / Math.max(s, target, 1) }; })
       .filter((c) => c.miss < Math.abs(gap))
       .sort((a, b) => a.miss - b.miss).slice(0, 3);
@@ -1116,8 +1216,16 @@ function renderAll() {
 
 // League-wide value rankings by position
 function renderRankings() {
-  const tabsList = ["All", "QB", "RB", "WR", "TE", "K", "DEF"];
+  const tabsList = ["All", "QB", "RB", "WR", "TE", "K", "DEF"].concat(S.keepReady ? ["Keepers"] : []);
+  if (!tabsList.includes(S.rkPos)) S.rkPos = "RB";
+  if (S.seasonOver && S.keepReady && S.rkPos !== "Keepers" && !S.rkPicked) S.rkPos = "Keepers";
   $("rkTabs").innerHTML = tabsList.map((t) => `<button type="button" data-rk="${t}" aria-pressed="${S.rkPos === t}">${t}</button>`).join("");
+  const isKeep = S.rkPos === "Keepers";
+  for (const id of ["adjHint", "resetAdj"]) $(id).hidden = isKeep;
+  $("rkFA").parentElement.hidden = isKeep;
+  document.querySelector("#rankView .srcbar").hidden = isKeep;
+  $("commHint").hidden = isKeep;
+  if (isKeep) { renderKeeperRankings(); return; }
   const q = S.rkQ.trim().toLowerCase();
   const keep = kwEff() > 0;
   let ids = Object.keys(S.ros).filter((pid) => S.players[pid]
@@ -1141,7 +1249,7 @@ function renderRankings() {
     const tier = S.rkPos !== "All" && i > 0 && i % teams === 0 && !q;
     const tg = tags(pid);
     html += `<tr data-pid="${pid}" class="${ownerId === myId ? "mine" : ""}${tier ? " tier" : ""}${pid === S.justMoved ? " moved" : ""}">
-      ${S.src === "comm" ? `<td class="drag"></td>` : `<td class="drag" data-drag="${pid}" title="Drag to move">⠿</td>`}
+      ${S.src !== "mine" ? `<td class="drag"></td>` : `<td class="drag" data-drag="${pid}" title="Drag to move">⠿</td>`}
       <td class="rnk">${i + 1}</td>
       <td class="pl"><b>${esc(p[0])}</b> <span class="muted">${pos}${S.posRank[pid] || ""} · ${esc(p[2])}</span>${tg ? `<div class="tags">${tg}</div>` : ""}</td>
       <td>${owner}</td>
@@ -1153,6 +1261,48 @@ function renderRankings() {
     </tr>`;
   });
   $("rkTable").innerHTML = html + (ids.length ? "" : `<tr><td colspan="10" class="empty" style="padding:14px">No players match.</td></tr>`) + "</tbody>";
+}
+// Projected spot in next year's draft from next-year value rank, e.g. 3.07; past the last round = undrafted
+function projAdp(pid) {
+  const rank = S.dpRank && S.dpRank[pid];
+  const teams = S.league ? S.league.total_rosters : 12;
+  if (!rank) return { label: "Undrafted", rank: Infinity };
+  // Rookies aren't in the value data, so veterans after round 1 slide back by the rookies drafted ahead of them
+  const spot = rank <= teams ? rank : Math.round(teams + (rank - teams) / (1 - ROOKIE_SHARE));
+  if (spot > teams * S.rounds) return { label: "Undrafted", rank: Infinity };
+  const rd = Math.ceil(spot / teams), pk = spot - (rd - 1) * teams;
+  return { label: `${rd}.${String(pk).padStart(2, "0")}`, rank: spot, rd };
+}
+function renderKeeperRankings() {
+  const q = S.rkQ.trim().toLowerCase();
+  const myId = S.myRosterId != null ? S.myRosterId : Number($("teamA").value);
+  // Each team's best 3 by keeper value
+  const top3 = new Set();
+  for (const r of S.rosters) (r.players || []).filter((x) => keepBonus(x) > 0).sort((a, b) => keepBonus(b) - keepBonus(a)).slice(0, KEEPERS).forEach((x) => top3.add(x));
+  let ids = Object.keys(S.keep).filter((pid) => S.keep[pid].has && S.players[pid] && S.owner[pid] != null && (!q || nameOf(pid).toLowerCase().includes(q)));
+  ids.sort((a, b) => (S.keep[b].ok - S.keep[a].ok) || S.keep[b].surplus - S.keep[a].surplus);
+  ids = ids.slice(0, 200);
+  const top = Math.max(1, ...ids.map((x) => Math.max(0, S.keep[x].surplus)));
+  $("rkMeta").textContent = `Keeper value · cost is 1 round above last year's pick, undrafted = R${S.rounds} · ${ids.length} players`;
+  let html = `<thead><tr><th aria-label="Drag"></th><th>#</th><th>Player</th><th>Fantasy team</th><th class="n">Keep cost</th><th class="n" title="Projected spot in next year's draft, from next-year value, allowing for 1 rookie in every 16 picks after round 1">Proj. ADP</th><th class="n">Next-yr value</th><th class="n">Keeper value</th></tr></thead><tbody>`;
+  ids.forEach((pid, i) => {
+    const k = S.keep[pid], d = S.draft[pid], p = S.players[pid], adp = projAdp(pid);
+    const t = keeperTier(k.surplus);
+    const cost = !k.ok ? `<span class="muted">Not keepable</span>` : `R${k.cost}${d ? "" : "*"}`;
+    const gain = k.ok && adp.rd ? (k.cost - adp.rd) : null;   // rounds of value gained vs where he'd go
+    html += `<tr class="${S.owner[pid] === myId ? "mine" : ""}">
+      <td class="drag"></td>
+      <td class="rnk">${i + 1}</td>
+      <td class="pl"><b>${esc(p[0])}</b> <span class="muted">${posOf(pid)}${S.posRank[pid] || ""} · ${esc(p[2])}</span>
+        <div class="tags">${k.ok ? `<span class="tag ${t.cls}">${t.label}</span>` : ""}${top3.has(pid) ? `<span class="tag top">Team's top ${KEEPERS}</span>` : ""}${d ? "" : `<span class="tag k-fair" title="Not drafted this season">Undrafted</span>`}</div></td>
+      <td>${esc(teamName(rosterById(S.owner[pid])))}</td>
+      <td class="n">${cost}</td>
+      <td class="n">${adp.label}${gain != null && gain > 0 ? `<small class="dl" title="He'd go this many rounds before his keeper cost">+${plural(gain, "round")} of value</small>` : ""}</td>
+      <td class="n">${fmt0(k.dp)}</td>
+      <td class="n"><b>${k.ok ? (k.surplus >= 0 ? "+" : "") + fmt0(k.surplus) : "·"}</b><div class="vbar"><i style="width:${k.ok ? Math.round((Math.max(0, k.surplus) / top) * 100) : 0}%"></i></div></td>
+    </tr>`;
+  });
+  $("rkTable").innerHTML = html + (ids.length ? "" : `<tr><td colspan="8" class="empty" style="padding:14px">No players match.</td></tr>`) + "</tbody>";
 }
 function adjCell(pid) {
   const a = S.adj[pid] || 0, pct = Math.round(a * 100);
@@ -1351,8 +1501,9 @@ function applyShared() {
   if (sh.fw != null && sh.fw !== S.fw) { setForm(sh.fw); computeValues(); renderLeagueInfo(); }
   if (sh.t && rosterById(sh.t.a) && rosterById(sh.t.b)) {
     $("teamA").value = sh.t.a; $("teamB").value = sh.t.b;
-    S.sel.A = new Set((sh.t.sa || []).filter((pid) => (rosterById(sh.t.a).players || []).includes(pid)));
-    S.sel.B = new Set((sh.t.sb || []).filter((pid) => (rosterById(sh.t.b).players || []).includes(pid)));
+    const owns = (rid) => (pid) => (isPick(pid) ? String(S.pickOwner[pid]) === String(rid) : (rosterById(rid).players || []).includes(pid));
+    S.sel.A = new Set((sh.t.sa || []).filter(owns(sh.t.a)));
+    S.sel.B = new Set((sh.t.sb || []).filter(owns(sh.t.b)));
   }
   if (sh.adj && Object.keys(sh.adj).length) {
     $("shareBannerText").textContent = `This link includes someone's ranking adjustments for ${plural(Object.keys(sh.adj).length, "player")}.` +
@@ -1360,7 +1511,31 @@ function applyShared() {
     $("shareBanner").hidden = false;
   }
   S.shared = sh.adj ? { adj: sh.adj } : null;
-  history.replaceState(null, "", location.href.split("#")[0]);
+  try { history.replaceState(null, "", location.href.split("#")[0]); } catch { /* some file:// pages refuse */ }
+}
+
+// When the page is reopened after a while, check Sleeper's current week and reload if it moved on
+async function refreshIfStale() {
+  if (!S.loadArgs || S.refreshing || document.visibilityState !== "visible") return;
+  if (Date.now() - S.loadedAt < 30 * 60 * 1000) return;   // at most every 30 minutes
+  S.refreshing = true;
+  try {
+    const state = await getJSON(`${API}/state/nfl`);
+    const now = { week: state.week, type: state.season_type, season: state.league_season || state.season };
+    const was = S.loadedState || {};
+    if (now.week === was.week && now.type === was.type && String(now.season) === String(was.season)) { S.loadedAt = Date.now(); return; }
+    const keep = { a: $("teamA").value, b: $("teamB").value, sa: [...S.sel.A], sb: [...S.sel.B] };
+    setStatus("A new week started, so values are refreshing…");
+    await loadLeague(S.loadArgs.leagueId, state, S.loadArgs.userId);
+    // put the trade back the way it was
+    if (rosterById(keep.a) && rosterById(keep.b)) {
+      $("teamA").value = keep.a; $("teamB").value = keep.b;
+      const owns = (rid) => (pid) => (isPick(pid) ? String(S.pickOwner[pid]) === String(rid) : (rosterById(rid).players || []).includes(pid));
+      S.sel.A = new Set(keep.sa.filter(owns(keep.a))); S.sel.B = new Set(keep.sb.filter(owns(keep.b)));
+      renderAll();
+    }
+  } catch { /* try again next time the page is opened */ }
+  finally { S.refreshing = false; }
 }
 
 function setPage(pg) {
@@ -1372,7 +1547,18 @@ function setPage(pg) {
   $("rankView").hidden = !loaded || S.page !== "rank";
   if (loaded) renderAll();
 }
-function toggle(side, pid) { const s = S.sel[side]; s.has(pid) ? s.delete(pid) : s.add(pid); renderAll(); }
+function toggle(side, pid) {
+  const s = S.sel[side];
+  if (s.has(pid)) s.delete(pid);
+  else {
+    s.add(pid);
+    if (isPick(pid) && S.mode !== "keep" && S.keepReady) {
+      setMode("keep");
+      setStatus("Draft picks only matter for next season, so the view switched to Season + keepers.");
+    }
+  }
+  renderAll();
+}
 
 // ---- Settings ----
 function setStar(mode) {
@@ -1403,7 +1589,7 @@ function setMode(m) {
 }
 function renderModeHint() {
   const h = $("modeHint"); if (!h) return;
-  if (S.mode === "season") { h.textContent = "Rest of this season only."; return; }
+  if (S.mode === "season") { h.textContent = S.seasonOver ? "The season is over, so switch to Season + keepers to see values." : "Rest of this season only."; return; }
   if (S.league && !S.keepReady) { h.textContent = "Keeper data couldn't be loaded, so this view matches This season."; return; }
   h.textContent = `Adds ${S.kw === 1 ? "full" : "half"} keeper surplus to each player. Roster tabs gain a Keepers view.`;
 }
@@ -1454,7 +1640,7 @@ function init() {
   const sw = store.get("td_keepw"); setKeep([0.5, 1].includes(sw) ? sw : 0.5);
   setMode(store.get("td_mode") || "season");
   $("pageTabs").addEventListener("click", (e) => { const b = e.target.closest("[data-page]"); if (b) setPage(b.dataset.page); });
-  $("rkTabs").addEventListener("click", (e) => { const b = e.target.closest("[data-rk]"); if (!b) return; S.rkPos = b.dataset.rk; renderRankings(); });
+  $("rkTabs").addEventListener("click", (e) => { const b = e.target.closest("[data-rk]"); if (!b) return; S.rkPos = b.dataset.rk; S.rkPicked = true; renderRankings(); });
   $("rkQ").addEventListener("input", (e) => { S.rkQ = e.target.value; renderRankings(); });
   $("rkTable").addEventListener("click", (e) => {
     const b = e.target.closest("[data-adj]"); if (!b) return;
@@ -1503,6 +1689,8 @@ function init() {
   });
   $("shKeep").addEventListener("click", () => { S.shared = null; $("shareBanner").hidden = true; });
   initDrag();
+  document.addEventListener("visibilitychange", refreshIfStale);
+  window.addEventListener("focus", refreshIfStale);
   S.shared = readShared();
   S.adj = store.get("td_adj") || {};
   S.contrib = store.get("td_contrib") !== false; $("contrib").checked = S.contrib;
@@ -1515,7 +1703,10 @@ function init() {
   $("modeTabs").addEventListener("click", (e) => { const b = e.target.closest("[data-mode]"); if (!b) return; setMode(b.dataset.mode); if (S.league) renderAll(); });
   const sf = store.get("td_form"); setForm([0, 0.25, 0.5].includes(sf) ? sf : 0.25);
   $("who").value = S.shared && S.shared.l ? `https://sleeper.com/leagues/${S.shared.l}` : store.get("td_input") || DEFAULT_INPUT;
-  if ($("who").value) $("loadForm").requestSubmit();
+  if ($("who").value) {
+    const f = $("loadForm");
+    if (f.requestSubmit) f.requestSubmit(); else f.dispatchEvent(new Event("submit", { cancelable: true }));
+  }
 }
 if (typeof document !== "undefined" && document.getElementById("loadForm")) init();
 </script>
