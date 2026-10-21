@@ -181,6 +181,12 @@ body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select:
 .srcbar select { padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--r); background: var(--sheet); font-size: 13px; }
 .comm { font: 600 13px var(--mono); white-space: nowrap; }
 .comm small { display: block; font: 400 11px var(--body); color: var(--muted); }
+.modal { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; background: color-mix(in srgb, var(--ink) 45%, transparent);
+  padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); }
+.mbox { background: var(--sheet); color: var(--ink); border: 1px solid var(--line); border-radius: var(--r); padding: 20px; max-width: 440px; width: 100%; display: grid; gap: 12px; box-shadow: 0 12px 40px color-mix(in srgb, var(--ink) 25%, transparent); }
+.mbox h2 { margin: 0; font: 800 24px/1.05 var(--display); text-transform: uppercase; }
+.mbox p { margin: 0; color: var(--muted); }
+.mact { display: flex; justify-content: flex-end; }
 .tag.you { background: var(--ink); color: var(--chain); }
 .btn.small { padding: 7px 10px; font-size: 12px; }
 .sharepanel { padding: 14px 16px; display: grid; gap: 10px; }
@@ -435,7 +441,7 @@ footer { font-size: 12px; color: var(--muted); }
         <li>Replacement level at each position is the 2nd best player on your league's waiver wire. Season value is rest-of-season points above that.</li>
         <li>Values run 0 to 1,000, where 1,000 is the most valuable player in your league.</li>
         <li>Keeper value is next year's value (DynastyProcess open data) minus the value of the round he'd cost: 1 round earlier than this season, or the last round if undrafted.</li>
-        <li>Draft picks: next year's order is random, so each pick is worth the average player in its round. Only clear-cut keepers (Strong or Elite value) are assumed off the board, and that is counted at half strength, since teams don't always keep their best players. Picks 2 or more seasons out count at 75%. Picks only count in the Season + keepers view.</li>
+        <li>Draft picks are tracked for every team and can be added to trades, but they aren't given a value. Weigh them case by case. The only pick effect counted is a keeper lost by trading away your own pick in his round.</li>
         <li>A keeper can only be kept with the team's own original pick in his cost round, and only one keeper per round. Picks acquired in trades can't be used. If a team trades away its own pick in that round, the keeper value is lost, and the trade counts that loss.</li>
         <li>The star premium makes one great player worth more than two good ones. Auto sets it from your league's size.</li>
         <li>Your ranking adjustments scale a player's value by a percentage. When the community database is connected, everyone's adjustments are shared anonymously and the Community view uses the median adjustment for each player.</li>
@@ -443,6 +449,16 @@ footer { font-size: 12px; color: var(--muted); }
       </ol>
     </div>
   </details>
+
+  <div class="modal" id="pickModal" hidden>
+    <div class="mbox" role="dialog" aria-modal="true" aria-labelledby="pickTitle">
+      <h2 id="pickTitle">Draft picks aren't valued</h2>
+      <p>Picks are tracked and can be added to trades, but they count as zero in the trade score. Their worth depends on the round, the draft pool and who you'd keep, so weigh each one case by case.</p>
+      <p>Trading your own pick can still cost you a keeper. If it does, the trade shows that keeper value as lost.</p>
+      <label class="check"><input type="checkbox" id="pickNever"> Don't show this again</label>
+      <div class="mact"><button type="button" class="btn" id="pickOk">Got it</button></div>
+    </div>
+  </div>
 
   <footer>Data from the public Sleeper API and DynastyProcess open data. Reload to refresh projections and stats.</footer>
 </div>
@@ -688,7 +704,8 @@ const baseOf = (pid) => (S.value[pid] || 0) + kwEff() * ownKeep(pid);   // model
 // A piece's value to the team receiving it (keeper value needs the receiver's own pick in that round)
 const valFor = (pid, rid, sentIds) => (isPick(pid) ? valOf(pid)
   : ((S.value[pid] || 0) + kwEff() * teamKeepBonus(pid, rid, sentIds)) * (1 + adjOf(pid)));
-const valOf = (pid) => (isPick(pid) ? kwEff() * pickBase(pid) : baseOf(pid) * (1 + adjOf(pid)));
+// Draft picks are tracked and tradeable but not valued: they're weighed case by case
+const valOf = (pid) => (isPick(pid) ? 0 : baseOf(pid) * (1 + adjOf(pid)));
 const ppgOf = (pid) => S.ppg[pid] || 0;
 
 // ---- Loading ----
@@ -1100,7 +1117,6 @@ function renderRoster(side) {
 }
 
 function renderPicks(side, r, ids, q) {
-  const live = kwEff() > 0;
   // Which of this team's picks its likely keepers would use up (keepers cost the pick in their round)
   const keptRounds = {};
   if (S.keepReady) bestKeepers(r.players || [], r.roster_id).forEach((x) => { keptRounds[x.r] = nameOf(x.pid); });
@@ -1108,7 +1124,7 @@ function renderPicks(side, r, ids, q) {
   // tag the team's own pick first when it has two in the same round
   ids = ids.slice().sort((a, b) => { const x = pickParts(a), y = pickParts(b);
     return x.season - y.season || x.round - y.round || (String(y.orig) === String(r.roster_id)) - (String(x.orig) === String(r.roster_id)); });
-  let html = `<li class="grp">${!S.keepReady ? "Pick values need the keeper data, which didn't load" : live ? "Random draft order: every pick in a round is worth the same" : "Picks count only in Season + keepers. Adding one switches views."}</li>`;
+  let html = `<li class="grp">Picks are tracked but not valued · weigh them case by case</li>`;
   for (const id of ids.filter((x) => !q || nameOf(x).toLowerCase().includes(q))) {
     const p = pickParts(id), on = S.sel[side].has(id);
     const own = String(p.orig) === String(r.roster_id);
@@ -1116,11 +1132,10 @@ function renderPicks(side, r, ids, q) {
     const usedHere = own && p.season === S.nextSeason && keptRounds[p.round] && !tagged.has(p.round);
     if (usedHere) tagged.add(p.round);   // a keeper uses one pick in his round, so tag only one
     const keepTag = usedHere ? `<span class="tags"><span class="tag k-fair" title="Keepers cost the pick in their round">Likely used to keep ${esc(keptRounds[p.round])}</span></span>` : "";
-    const v = S.kw * pickBase(id);
     html += `<li class="p" role="button" tabindex="0" aria-pressed="${on}" data-side="${side}" data-pid="${id}">
       <span class="box">${on ? "✓" : ""}</span>
       <span class="nm"><b>${p.season} Round ${p.round}</b><span class="l2">${note}</span>${keepTag}</span>
-      <span class="val"><b>${fmt0(live ? valOf(id) : v)}</b>${live ? "" : "<small>keepers view</small>"}</span>
+      <span class="val"><small>Not valued</small></span>
     </li>`;
   }
   $(`list${side}`).innerHTML = html;
@@ -1174,7 +1189,7 @@ function renderTrade() {
   const gotB = Math.max(0, sideScore(aSends.map(vB), S.p) - lossB);
   const lostKeep = (pid, val) => !isPick(pid) && kwEff() > 0 && ownKeep(pid) > 0 && val(pid) < valOf(pid) - 0.5;
   const pieceList = (ids, side, val) => ids.length
-    ? ids.map((pid) => `<div class="piece"><span class="pn">${esc(nameOf(pid))} <small>${posOf(pid)}${lostKeep(pid, val) ? ` · no keeper value for them` : ""}</small></span><span class="pv">${fmt0(val(pid))}</span><button type="button" class="x" data-side="${side}" data-pid="${pid}" aria-label="Remove ${esc(nameOf(pid))}">×</button></div>`).join("")
+    ? ids.map((pid) => `<div class="piece"><span class="pn">${esc(nameOf(pid))} <small>${posOf(pid)}${lostKeep(pid, val) ? ` · no keeper value for them` : ""}</small></span><span class="pv">${isPick(pid) ? `<small class="muted">Not valued</small>` : fmt0(val(pid))}</span><button type="button" class="x" data-side="${side}" data-pid="${pid}" aria-label="Remove ${esc(nameOf(pid))}">×</button></div>`).join("")
     : `<div class="empty">Pick players or picks from this roster below</div>`;
   $("piecesA").innerHTML = pieceList(aSends, "A", vB);
   $("piecesB").innerHTML = pieceList(bSends, "B", vA);
@@ -1204,15 +1219,21 @@ function renderTrade() {
   $("mlA").textContent = `${nA} gets ${fmt0(gotA)}`;
   $("mlB").textContent = `${nB} gets ${fmt0(gotB)}`;
   const vd = verdictFor(gap), diff = Math.abs(gotA - gotB);
-  if (vd.cls === "fair") {
+  const hasPicks = aSends.some(isPick) || bSends.some(isPick);
+  const pickNote = hasPicks ? " Draft picks aren't counted, so weigh them case by case." : "";
+  if (hasPicks && gotA + gotB < 1) {
+    v.textContent = "Picks only"; v.className = "verdict";
+    why.textContent = "Draft picks aren't valued here, so judge this one case by case.";
+    $("fill").style.width = "50%";
+  } else if (vd.cls === "fair") {
     v.textContent = vd.label; v.className = "verdict fair";
-    why.textContent = `Both sides land within ${Math.max(1, Math.round(Math.abs(gap) * 100))}% of each other.`;
+    why.textContent = `Both sides land within ${Math.max(1, Math.round(Math.abs(gap) * 100))}% of each other.` + pickNote;
   } else {
     const winner = gap > 0 ? nA : nB;
     v.textContent = vd.label === "Slight edge" ? `Slight edge: ${winner}` : `${vd.label} ${winner}`;
     v.className = `verdict ${vd.cls}`;
     const like = closestPlayer(diff);
-    why.textContent = `${winner} comes out ${fmt0(diff)} ahead` + (like ? `, about the value of ${nameOf(like)} (${posOf(like)}${S.posRank[like] || ""}).` : ".");
+    why.textContent = `${winner} comes out ${fmt0(diff)} ahead` + (like ? `, about the value of ${nameOf(like)} (${posOf(like)}${S.posRank[like] || ""}).` : ".") + pickNote;
   }
 
   // Impact table
@@ -1225,13 +1246,6 @@ function renderTrade() {
   if (kwEff() > 0) {
     const kA = keeperImpact(rA, aSends, bSends), kB = keeperImpact(rB, bSends, aSends);
     rows += `<tr><td>Best ${KEEPERS} keepers</td>${cell(kA, fmt0, SCALE / 200)}${cell(kB, fmt0, SCALE / 200)}</tr>`;
-    if (aSends.some(isPick) || bSends.some(isPick)) {
-      const pk = (r, sends, gets) => {
-        const own = teamPicks(r.roster_id), sum = (ids) => ids.reduce((a, id) => a + valOf(id), 0);
-        return { before: sum(own), after: sum(own.filter((id) => !sends.includes(id)).concat(gets.filter(isPick))) };
-      };
-      rows += `<tr><td>Draft pick value</td>${cell(pk(rA, aSends, bSends), fmt0, SCALE / 200)}${cell(pk(rB, bSends, aSends), fmt0, SCALE / 200)}</tr>`;
-    }
   }
   $("impact").innerHTML = rows + "</tbody>";
 
@@ -1242,7 +1256,7 @@ function renderTrade() {
     const payerRoster = sideRoster(payer);
     const current = [...S.sel[payer]];
     const target = payer === "A" ? gotA : gotB;
-    const cands = [...(payerRoster.players || []), ...(kwEff() > 0 ? teamPicks(payerRoster.roster_id) : [])]
+    const cands = [...(payerRoster.players || [])]
       .filter((pid) => (S.players[pid] || isPick(pid)) && !S.sel[payer].has(pid) && valOf(pid) > 0)
       .map((pid) => {
         const recv = sideRoster(payer === "A" ? "B" : "A"), rs = [...S.sel[payer === "A" ? "B" : "A"]];
@@ -1600,15 +1614,21 @@ function setPage(pg) {
   $("rankView").hidden = !loaded || S.page !== "rank";
   if (loaded) renderAll();
 }
+function showPickNotice() {
+  if (store.get("td_pick_notice_off")) return;
+  $("pickModal").hidden = false;
+  $("pickOk").focus();
+}
+function closePickNotice() {
+  if ($("pickNever").checked) store.set("td_pick_notice_off", true);
+  $("pickModal").hidden = true;
+}
 function toggle(side, pid) {
   const s = S.sel[side];
   if (s.has(pid)) s.delete(pid);
   else {
     s.add(pid);
-    if (isPick(pid) && S.mode !== "keep" && S.keepReady) {
-      setMode("keep");
-      setStatus("Draft picks only matter for next season, so the view switched to Season + keepers.");
-    }
+    if (isPick(pid)) showPickNotice();
   }
   renderAll();
 }
@@ -1742,6 +1762,9 @@ function init() {
   });
   $("shKeep").addEventListener("click", () => { S.shared = null; $("shareBanner").hidden = true; });
   initDrag();
+  $("pickOk").addEventListener("click", closePickNotice);
+  $("pickModal").addEventListener("click", (e) => { if (e.target === $("pickModal")) closePickNotice(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("pickModal").hidden) closePickNotice(); });
   document.addEventListener("visibilitychange", refreshIfStale);
   window.addEventListener("focus", refreshIfStale);
   S.shared = readShared();
