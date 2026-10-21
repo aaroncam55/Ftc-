@@ -436,6 +436,7 @@ footer { font-size: 12px; color: var(--muted); }
         <li>Values run 0 to 1,000, where 1,000 is the most valuable player in your league.</li>
         <li>Keeper value is next year's value (DynastyProcess open data) minus the value of the round he'd cost: 1 round earlier than this season, or the last round if undrafted.</li>
         <li>Draft picks: next year's order is random, so each pick is worth the average player in its round. Only clear-cut keepers (Strong or Elite value) are assumed off the board, and that is counted at half strength, since teams don't always keep their best players. Picks 2 or more seasons out count at 75%. Picks only count in the Season + keepers view.</li>
+        <li>A keeper can only be kept with the team's own original pick in his cost round, and only one keeper per round. Picks acquired in trades can't be used. If a team trades away its own pick in that round, the keeper value is lost, and the trade counts that loss.</li>
         <li>The star premium makes one great player worth more than two good ones. Auto sets it from your league's size.</li>
         <li>Your ranking adjustments scale a player's value by a percentage. When the community database is connected, everyone's adjustments are shared anonymously and the Community view uses the median adjustment for each player.</li>
         <li>Lineup impact rebuilds each team's best starting lineup after the trade, including drops forced by roster limits.</li>
@@ -661,7 +662,32 @@ const keepBonus = (pid) => { const k = S.keep[pid]; return k && k.ok && k.has ? 
 const kwEff = () => (S.keepReady && S.mode === "keep" ? S.kw : 0);
 const commOn = () => !!(COMMUNITY.url && COMMUNITY.key);
 const adjOf = (pid) => S.src === "mine" ? S.adj[pid] || 0 : S.src === "comm" ? (S.comm[pid] ? S.comm[pid].median : 0) : 0;
-const baseOf = (pid) => (S.value[pid] || 0) + kwEff() * keepBonus(pid);   // model value before your adjustment
+// Keepers can only be kept with the team's ORIGINAL pick in their cost round (traded-for picks don't count)
+function ownsOwnPick(rid, round, sentIds) {
+  if (!S.pickOwner || rid == null) return true;
+  const id = `pk:${S.nextSeason}:${round}:${rid}`;
+  if (!(id in S.pickOwner)) return true;
+  return String(S.pickOwner[id]) === String(rid) && !(sentIds && sentIds.includes(id));
+}
+function teamKeepBonus(pid, rid, sentIds) {
+  const k = S.keep[pid];
+  if (!k || !k.ok || !k.has) return 0;
+  return ownsOwnPick(rid, k.cost, sentIds) ? Math.max(0, k.surplus) : 0;
+}
+// A team's usable keepers: best first, at most KEEPERS, and only one per round (one original pick per round)
+function bestKeepers(pids, rid, sentIds) {
+  const c = pids.map((pid) => ({ pid, b: teamKeepBonus(pid, rid, sentIds), r: S.keep[pid] && S.keep[pid].cost }))
+    .filter((x) => x.b > 0).sort((a, b) => b.b - a.b);
+  const used = new Set(), out = [];
+  for (const x of c) { if (used.has(x.r)) continue; used.add(x.r); out.push(x); if (out.length === KEEPERS) break; }
+  return out;
+}
+const keepTotal = (pids, rid, sentIds) => bestKeepers(pids, rid, sentIds).reduce((a, x) => a + x.b, 0);
+const ownKeep = (pid) => (S.owner[pid] == null ? keepBonus(pid) : teamKeepBonus(pid, S.owner[pid]));
+const baseOf = (pid) => (S.value[pid] || 0) + kwEff() * ownKeep(pid);   // model value before your adjustment
+// A piece's value to the team receiving it (keeper value needs the receiver's own pick in that round)
+const valFor = (pid, rid, sentIds) => (isPick(pid) ? valOf(pid)
+  : ((S.value[pid] || 0) + kwEff() * teamKeepBonus(pid, rid, sentIds)) * (1 + adjOf(pid)));
 const valOf = (pid) => (isPick(pid) ? kwEff() * pickBase(pid) : baseOf(pid) * (1 + adjOf(pid)));
 const ppgOf = (pid) => S.ppg[pid] || 0;
 
@@ -934,7 +960,8 @@ function pickBase(id) {
 }
 function buildPicks() {
   S.nextSeason = Number(S.league.season) + (S.preDraft ? 0 : 1);   // the next draft this league will hold
-  const rounds = Number((S.league.settings || {}).draft_rounds) || S.rounds;
+  // Sleeper's draft_rounds setting only covers pick trading (it defaults to 3), so use the real draft length
+  const rounds = Math.max(S.rounds, Number((S.league.settings || {}).draft_rounds) || 0);
   const seasons = new Set([S.nextSeason]);
   for (const t of S.traded) if (Number(t.season) >= S.nextSeason) seasons.add(Number(t.season));
   S.pickOwner = {};
@@ -1008,6 +1035,7 @@ function tags(pid) {
     const k = S.keep[pid], d = S.draft[pid];
     if (k && k.has) {
       if (!k.ok) out.push(`<span class="tag k-over" title="Cost R${d ? d.round : "?"} this season, so next year would be before round 1">Not keepable</span>`);
+      else if (!ownsOwnPick(S.owner[pid], k.cost)) out.push(`<span class="tag k-over" title="Keepers need the team's original pick in that round, and it was traded">Can't keep: own R${k.cost} traded</span>`);
       else {
         const t2 = keeperTier(k.surplus), s = Math.round(k.surplus);
         const src = d ? `cost R${d.round} this season${d.keeper ? " as a keeper" : ""}` : "not found in this season's draft, treated as undrafted";
@@ -1034,7 +1062,7 @@ function renderRoster(side) {
   $(`m${side}`).textContent = `${st.wins || 0}-${st.losses || 0}${st.ties ? "-" + st.ties : ""} · lineup ${fmt1(lineup.total)}/wk`;
   const myPicks = teamPicks(r.roster_id);
   if (S.filt[side] === "Picks" ? !myPicks.length : S.filt[side] === "Keepers" ? kwEff() === 0 : S.filt[side] !== "All" && !all.some((x) => posOf(x) === S.filt[side])) S.filt[side] = "All";
-  const kTop = new Set(all.filter((x) => keepBonus(x) > 0).sort((a, b) => keepBonus(b) - keepBonus(a)).slice(0, KEEPERS));
+  const kTop = new Set(bestKeepers(all, r.roster_id).map((x) => x.pid));
   renderTabs(side, all);
   const q = S.q[side].trim().toLowerCase();
   if (S.filt[side] === "Picks") { renderPicks(side, r, myPicks, q); return; }
@@ -1042,7 +1070,7 @@ function renderRoster(side) {
   const shown = all.filter((pid) => (S.filt[side] === "All" || keepView ? (!keepView || (S.keep[pid] && S.keep[pid].has)) : posOf(pid) === S.filt[side]) && (!q || nameOf(pid).toLowerCase().includes(q)));
   const groups = {};
   if (keepView) {
-    groups.Keepers = shown.sort((a, b) => keepBonus(b) - keepBonus(a) || (S.keep[b].surplus - S.keep[a].surplus));
+    groups.Keepers = shown.sort((a, b) => ownKeep(b) - ownKeep(a) || (S.keep[b].surplus - S.keep[a].surplus));
   } else {
     for (const pid of shown) (groups[posOf(pid)] = groups[posOf(pid)] || []).push(pid);
     for (const pos in groups) groups[pos].sort((a, b) => valOf(b) - valOf(a) || ppgOf(b) - ppgOf(a));
@@ -1059,7 +1087,7 @@ function renderRoster(side) {
       const on = S.sel[side].has(pid);
       const ppos = posOf(pid);
       const rank = S.posRank[pid] ? `${ppos}${S.posRank[pid]}` : ppos;
-      const kb = kwEff() * keepBonus(pid);
+      const kb = kwEff() * ownKeep(pid);
       const tg = (kwEff() > 0 && kTop.has(pid) ? `<span class="tag top">Top ${KEEPERS} keeper</span>` : "") + tags(pid);
       html += `<li class="p" role="button" tabindex="0" aria-pressed="${on}" data-side="${side}" data-pid="${pid}">
         <span class="box">${on ? "✓" : ""}</span>
@@ -1075,14 +1103,19 @@ function renderPicks(side, r, ids, q) {
   const live = kwEff() > 0;
   // Which of this team's picks its likely keepers would use up (keepers cost the pick in their round)
   const keptRounds = {};
-  if (S.keepReady) (r.players || []).filter((x) => keepBonus(x) > 0).sort((x, y) => keepBonus(y) - keepBonus(x)).slice(0, KEEPERS)
-    .forEach((x) => { keptRounds[S.keep[x].cost] = nameOf(x); });
+  if (S.keepReady) bestKeepers(r.players || [], r.roster_id).forEach((x) => { keptRounds[x.r] = nameOf(x.pid); });
+  const tagged = new Set();
+  // tag the team's own pick first when it has two in the same round
+  ids = ids.slice().sort((a, b) => { const x = pickParts(a), y = pickParts(b);
+    return x.season - y.season || x.round - y.round || (String(y.orig) === String(r.roster_id)) - (String(x.orig) === String(r.roster_id)); });
   let html = `<li class="grp">${!S.keepReady ? "Pick values need the keeper data, which didn't load" : live ? "Random draft order: every pick in a round is worth the same" : "Picks count only in Season + keepers. Adding one switches views."}</li>`;
   for (const id of ids.filter((x) => !q || nameOf(x).toLowerCase().includes(q))) {
     const p = pickParts(id), on = S.sel[side].has(id);
     const own = String(p.orig) === String(r.roster_id);
-    const note = (own ? "Own pick" : `Originally ${esc(teamName(rosterById(p.orig)))}`) + (p.season > S.nextSeason ? ` · counted at ${Math.round(FUTURE_DISCOUNT * 100)}%` : "");
-    const keepTag = p.season === S.nextSeason && keptRounds[p.round] ? `<span class="tags"><span class="tag k-fair" title="Keepers cost the pick in their round">Likely used to keep ${esc(keptRounds[p.round])}</span></span>` : "";
+    const note = (own ? "Own pick" : `Originally ${esc(teamName(rosterById(p.orig)))} · can't be used for a keeper`) + (p.season > S.nextSeason ? ` · counted at ${Math.round(FUTURE_DISCOUNT * 100)}%` : "");
+    const usedHere = own && p.season === S.nextSeason && keptRounds[p.round] && !tagged.has(p.round);
+    if (usedHere) tagged.add(p.round);   // a keeper uses one pick in his round, so tag only one
+    const keepTag = usedHere ? `<span class="tags"><span class="tag k-fair" title="Keepers cost the pick in their round">Likely used to keep ${esc(keptRounds[p.round])}</span></span>` : "";
     const v = S.kw * pickBase(id);
     html += `<li class="p" role="button" tabindex="0" aria-pressed="${on}" data-side="${side}" data-pid="${id}">
       <span class="box">${on ? "✓" : ""}</span>
@@ -1112,8 +1145,15 @@ function lineupImpact(r, sends, gets) {
 }
 function keeperImpact(r, sends, gets) {
   const before = [...(r.players || []), ...(r.reserve || [])];
-  const after = before.filter((pid) => !sends.includes(pid)).concat(gets);
-  return { before: keeperTotal(before, keepBonus, KEEPERS), after: keeperTotal(after, keepBonus, KEEPERS) };
+  const after = before.filter((pid) => !sends.includes(pid)).concat(gets.filter((x) => !isPick(x)));
+  return { before: keepTotal(before, r.roster_id), after: keepTotal(after, r.roster_id, sends.filter(isPick)) };
+}
+// Keeper value a team gives up on players it KEEPS, because it traded away its own pick in their round
+function keeperLossFromPicks(r, sends) {
+  const sentPicks = sends.filter(isPick);
+  if (!sentPicks.length || !kwEff()) return 0;
+  const stay = (r.players || []).filter((pid) => !sends.includes(pid));
+  return kwEff() * Math.max(0, keepTotal(stay, r.roster_id) - keepTotal(stay, r.roster_id, sentPicks));
 }
 function closestPlayer(n) {
   if (n < SCALE / 50) return null;
@@ -1126,22 +1166,28 @@ const signed = (d, f) => `${d >= 0 ? "+" : ""}${f(d)}`;
 function renderTrade() {
   const rA = sideRoster("A"), rB = sideRoster("B");
   const aSends = [...S.sel.A], bSends = [...S.sel.B];
-  const gotA = sideScore(bSends.map(valOf), S.p);
-  const gotB = sideScore(aSends.map(valOf), S.p);
-  const pieceList = (ids, side) => ids.length
-    ? ids.map((pid) => `<div class="piece"><span class="pn">${esc(nameOf(pid))} <small>${posOf(pid)}</small></span><span class="pv">${fmt0(valOf(pid))}</span><button type="button" class="x" data-side="${side}" data-pid="${pid}" aria-label="Remove ${esc(nameOf(pid))}">×</button></div>`).join("")
+  // Each side is valued for the team receiving it, minus keeper value a team loses by sending its own picks
+  const vA = (pid) => valFor(pid, rA.roster_id, aSends);   // what A gets, from A's side
+  const vB = (pid) => valFor(pid, rB.roster_id, bSends);
+  const lossA = keeperLossFromPicks(rA, aSends), lossB = keeperLossFromPicks(rB, bSends);
+  const gotA = Math.max(0, sideScore(bSends.map(vA), S.p) - lossA);
+  const gotB = Math.max(0, sideScore(aSends.map(vB), S.p) - lossB);
+  const lostKeep = (pid, val) => !isPick(pid) && kwEff() > 0 && ownKeep(pid) > 0 && val(pid) < valOf(pid) - 0.5;
+  const pieceList = (ids, side, val) => ids.length
+    ? ids.map((pid) => `<div class="piece"><span class="pn">${esc(nameOf(pid))} <small>${posOf(pid)}${lostKeep(pid, val) ? ` · no keeper value for them` : ""}</small></span><span class="pv">${fmt0(val(pid))}</span><button type="button" class="x" data-side="${side}" data-pid="${pid}" aria-label="Remove ${esc(nameOf(pid))}">×</button></div>`).join("")
     : `<div class="empty">Pick players or picks from this roster below</div>`;
-  $("piecesA").innerHTML = pieceList(aSends, "A");
-  $("piecesB").innerHTML = pieceList(bSends, "B");
-  const sumLine = (ids, counted) => {
+  $("piecesA").innerHTML = pieceList(aSends, "A", vB);
+  $("piecesB").innerHTML = pieceList(bSends, "B", vA);
+  const sumLine = (ids, counted, val, loss, sender) => {
     if (!ids.length) return "";
-    const raw = ids.reduce((a, pid) => a + valOf(pid), 0);
-    return ids.length > 1 && S.p > 1
+    const raw = ids.reduce((a, pid) => a + val(pid), 0);
+    const lossNote = loss > 0.5 ? `<br><span>${esc(sender)} loses ${fmt0(loss)} keeper value by trading its own pick</span>` : "";
+    return (ids.length > 1 && S.p > 1 || loss > 0.5
       ? `<span>Total ${fmt0(raw)}, counts as</span><b>${fmt0(counted)}</b>`
-      : `<span>Total</span><b>${fmt0(raw)}</b>`;
+      : `<span>Total</span><b>${fmt0(raw)}</b>`) + lossNote;
   };
-  $("sumA").innerHTML = sumLine(aSends, gotB);
-  $("sumB").innerHTML = sumLine(bSends, gotA);
+  $("sumA").innerHTML = sumLine(aSends, gotB, vB, lossA, teamName(rA));
+  $("sumB").innerHTML = sumLine(bSends, gotA, vA, lossB, teamName(rB));
 
   const nA = teamName(rA), nB = teamName(rB);
   const v = $("verdict"), why = $("why");
@@ -1198,7 +1244,11 @@ function renderTrade() {
     const target = payer === "A" ? gotA : gotB;
     const cands = [...(payerRoster.players || []), ...(kwEff() > 0 ? teamPicks(payerRoster.roster_id) : [])]
       .filter((pid) => (S.players[pid] || isPick(pid)) && !S.sel[payer].has(pid) && valOf(pid) > 0)
-      .map((pid) => { const s = sideScore(current.concat(pid).map(valOf), S.p); return { pid, miss: Math.abs(s - target) / Math.max(s, target, 1) }; })
+      .map((pid) => {
+        const recv = sideRoster(payer === "A" ? "B" : "A"), rs = [...S.sel[payer === "A" ? "B" : "A"]];
+        const s = sideScore(current.concat(pid).map((x) => valFor(x, recv.roster_id, rs)), S.p);
+        return { pid, miss: Math.abs(s - target) / Math.max(s, target, 1) };
+      })
       .filter((c) => c.miss < Math.abs(gap))
       .sort((a, b) => a.miss - b.miss).slice(0, 3);
     if (cands.length) {
@@ -1254,7 +1304,7 @@ function renderRankings() {
       <td class="pl"><b>${esc(p[0])}</b> <span class="muted">${pos}${S.posRank[pid] || ""} · ${esc(p[2])}</span>${tg ? `<div class="tags">${tg}</div>` : ""}</td>
       <td>${owner}</td>
       <td class="n">${fmt1(ppgOf(pid))}</td>
-      ${keep ? `<td class="n">${fmt0(S.value[pid] || 0)}</td><td class="n">${fmt0(kwEff() * keepBonus(pid))}</td>` : ""}
+      ${keep ? `<td class="n">${fmt0(S.value[pid] || 0)}</td><td class="n">${fmt0(kwEff() * ownKeep(pid))}</td>` : ""}
       <td class="n">${adjCell(pid)}</td>
       ${commOn() ? `<td class="n">${commCell(pid)}</td>` : ""}
       <td class="n"><b>${fmt0(valOf(pid))}</b><div class="vbar"><i style="width:${Math.round((valOf(pid) / top) * 100)}%"></i></div></td>
@@ -1278,9 +1328,11 @@ function renderKeeperRankings() {
   const myId = S.myRosterId != null ? S.myRosterId : Number($("teamA").value);
   // Each team's best 3 by keeper value
   const top3 = new Set();
-  for (const r of S.rosters) (r.players || []).filter((x) => keepBonus(x) > 0).sort((a, b) => keepBonus(b) - keepBonus(a)).slice(0, KEEPERS).forEach((x) => top3.add(x));
+  for (const r of S.rosters) bestKeepers(r.players || [], r.roster_id).forEach((x) => top3.add(x.pid));
+  const blocked = (pid) => S.keep[pid].ok && !ownsOwnPick(S.owner[pid], S.keep[pid].cost);
   let ids = Object.keys(S.keep).filter((pid) => S.keep[pid].has && S.players[pid] && S.owner[pid] != null && (!q || nameOf(pid).toLowerCase().includes(q)));
-  ids.sort((a, b) => (S.keep[b].ok - S.keep[a].ok) || S.keep[b].surplus - S.keep[a].surplus);
+  const usable = (pid) => S.keep[pid].ok && !blocked(pid);
+  ids.sort((a, b) => (usable(b) - usable(a)) || S.keep[b].surplus - S.keep[a].surplus);
   ids = ids.slice(0, 200);
   const top = Math.max(1, ...ids.map((x) => Math.max(0, S.keep[x].surplus)));
   $("rkMeta").textContent = `Keeper value · cost is 1 round above last year's pick, undrafted = R${S.rounds} · ${ids.length} players`;
@@ -1288,7 +1340,8 @@ function renderKeeperRankings() {
   ids.forEach((pid, i) => {
     const k = S.keep[pid], d = S.draft[pid], p = S.players[pid], adp = projAdp(pid);
     const t = keeperTier(k.surplus);
-    const cost = !k.ok ? `<span class="muted">Not keepable</span>` : `R${k.cost}${d ? "" : "*"}`;
+    const cost = !k.ok ? `<span class="muted">Not keepable</span>`
+      : blocked(pid) ? `R${k.cost}${d ? "" : "*"}<small class="dl" title="Keepers need the team's original pick in that round">own pick traded</small>` : `R${k.cost}${d ? "" : "*"}`;
     const gain = k.ok && adp.rd ? (k.cost - adp.rd) : null;   // rounds of value gained vs where he'd go
     html += `<tr class="${S.owner[pid] === myId ? "mine" : ""}">
       <td class="drag"></td>
