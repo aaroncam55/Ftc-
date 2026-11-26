@@ -187,6 +187,20 @@ body.is-dragging, body.is-dragging * { cursor: grabbing !important; user-select:
 .mbox h2 { margin: 0; font: 800 24px/1.05 var(--display); text-transform: uppercase; }
 .mbox p { margin: 0; color: var(--muted); }
 .mact { display: flex; justify-content: flex-end; }
+.games { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; padding: 12px 14px 16px; }
+.game { border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; display: grid; }
+.game button { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: center; border: 0; background: var(--sheet); color: var(--ink); cursor: pointer; padding: 9px 12px; text-align: left; font: 500 14px var(--body); }
+.game button + button { border-top: 1px solid var(--line); }
+.game button:hover { background: var(--soft); }
+.game button .gn { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.game button .gs { font: 400 12px var(--mono); color: var(--muted); }
+.game button .gp { font: 600 13px var(--mono); min-width: 4ch; text-align: right; }
+.game button[aria-pressed="true"] { background: var(--turf-soft); }
+.game button[aria-pressed="true"] .gp { color: var(--turf); }
+.game button.lost { opacity: 0.5; }
+.game button.mine .gn::after { content: " (you)"; font-weight: 400; color: var(--muted); }
+.rk tr.cut td { border-bottom: 2px solid var(--marker); }
+.pct { font: 600 14px var(--mono); }
 .tag.you { background: var(--ink); color: var(--chain); }
 .btn.small { padding: 7px 10px; font-size: 12px; }
 .sharepanel { padding: 14px 16px; display: grid; gap: 10px; }
@@ -282,6 +296,7 @@ footer { font-size: 12px; color: var(--muted); }
     <div class="tabs page" id="pageTabs" aria-label="Page">
       <button type="button" data-page="trade" aria-pressed="true">Trade</button>
       <button type="button" data-page="rank" aria-pressed="false">Rankings</button>
+      <button type="button" data-page="po" aria-pressed="false">Playoffs</button>
     </div>
     <div class="modewrap">
       <span class="hint" id="modeHint"></span>
@@ -313,6 +328,20 @@ footer { font-size: 12px; color: var(--muted); }
       <button type="button" class="btn small" id="shUse">Use their adjustments</button>
       <button type="button" class="btn quiet small" id="shKeep">Keep mine</button>
     </span>
+  </section>
+
+  <section class="panel rankings" id="poView" hidden aria-label="Playoff odds">
+    <div class="rhead">
+      <div class="rtitle"><h2>Playoff odds</h2><span id="poMeta"></span></div>
+      <div class="hint" id="poHint">Loading the schedule…</div>
+    </div>
+    <div class="rkwrap"><table class="rk" id="poTable"></table></div>
+    <div class="rhead" style="border-top: 1px solid var(--line)">
+      <div class="rtitle"><h2>Remaining matchups</h2><span id="poLockMeta"></span></div>
+      <div class="tools"><div class="tabs" id="poWeeks"></div><button type="button" class="btn quiet small" id="poReset">Clear locked results</button></div>
+      <div class="hint">Win chances come from each team's projected starting lineup that week. Tap a team to lock in a win and see how everyone's odds change.</div>
+    </div>
+    <div class="games" id="poGames"></div>
   </section>
 
   <section class="panel rankings" id="rankView" hidden aria-label="Value rankings">
@@ -445,6 +474,7 @@ footer { font-size: 12px; color: var(--muted); }
         <li>A keeper can only be kept with the team's own original pick in his cost round, and only one keeper per round. Picks acquired in trades can't be used. If a team trades away its own pick in that round, the keeper value is lost, and the trade counts that loss.</li>
         <li>The star premium makes one great player worth more than two good ones. Auto sets it from your league's size.</li>
         <li>Your ranking adjustments scale a player's value by a percentage. When the community database is connected, everyone's adjustments are shared anonymously and the Community view uses the median adjustment for each player.</li>
+        <li>Playoff odds simulate the rest of the regular season 5,000 times on Sleeper's real schedule. Each team's weekly score is centered on its best projected lineup for that week, with a typical swing of about 20%. Teams are seeded by wins, then points for. Trades show how they change both teams' odds.</li>
         <li>Lineup impact rebuilds each team's best starting lineup after the trade, including drops forced by roster limits.</li>
       </ol>
     </div>
@@ -669,7 +699,7 @@ const S = {
   weeksData: [], statsWeeks: [], form: {}, ros: {}, value: {}, ppg: {}, posRank: {}, repl: {},
   weeksLeft: 0, fromWeek: 1, toWeek: 17, slots: [], maxRoster: 0, myRosterId: null,
   sel: { A: new Set(), B: new Set() }, filt: { A: "All", B: "All" }, q: { A: "", B: "" },
-  p: 1.35, starMode: "auto", kw: 0.5, fw: 0.25, mode: "season", page: "trade", rkPos: "RB", rkQ: "", rkFA: true, owner: {}, adj: {}, src: "mine", comm: {}, commMeta: null, commScope: "all", contrib: true, dirty: new Set(), leagueId: null, shared: null,
+  p: 1.35, starMode: "auto", kw: 0.5, fw: 0.25, mode: "season", page: "trade", po: null, poWeek: null, rkPos: "RB", rkQ: "", rkFA: true, owner: {}, adj: {}, src: "mine", comm: {}, commMeta: null, commScope: "all", contrib: true, dirty: new Set(), leagueId: null, shared: null,
   dp: null, draft: {}, draftCount: 0, rounds: 15, keep: {}, keepReady: false, trend: {}
 };
 const posOf = (pid) => (isPick(pid) ? "PICK" : S.players[pid] ? S.players[pid][1] : null);
@@ -888,6 +918,8 @@ async function loadLeague(leagueId, state, userId) {
   applyShared();
   setPage(S.page);
   if (commOn()) { loadCommunity(); if (S.contrib) pushAllMine(); }
+  S.po = null;
+  loadPlayoffs(leagueId, state).catch(() => { S.po = { weeks: [], games: {}, locks: {}, nPlay: 6, byes: 0, schedErr: true }; if (S.page === "po") renderPlayoffs(); });
   $("loadForm").hidden = true; $("pill").hidden = false;
   $("pillName").textContent = league.name;
   $("pillMeta").textContent = `${league.total_rosters} teams · ${S.seasonOver ? "keeper and pick values" : `weeks ${S.fromWeek} to ${S.toWeek}`}`;
@@ -963,6 +995,177 @@ function computeKeepers() {
   Object.keys(raw).sort((a, b) => raw[b] - raw[a]).forEach((sid, i) => { S.dpRank[sid] = i + 1; });
   fill(S.rv);
   S.keepReady = true;
+}
+
+// ---- Playoff odds ----
+const PO_SIMS = 5000;     // simulated seasons
+const PO_TRADE_SIMS = 2000;   // quicker run for comparing a trade, same random draws before and after
+const PO_SD = 0.2;        // a team's weekly score swings about 20% around its projection
+function mulberry32(a) {
+  return function () { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+function normCdf(x) {   // standard normal, Abramowitz-Stegun
+  const t = 1 / (1 + 0.3275911 * Math.abs(x) / Math.SQRT2);
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-(x * x) / 2);
+  return x >= 0 ? (1 + y) / 2 : (1 - y) / 2;
+}
+const sdOf = (mean) => Math.max(12, PO_SD * mean);
+function winChance(ma, mb) { return normCdf((ma - mb) / Math.sqrt(sdOf(ma) ** 2 + sdOf(mb) ** 2)); }
+
+async function loadPlayoffs(leagueId, state) {
+  const st = S.league.settings || {};
+  const playoffStart = Number(st.playoff_week_start) || 15;
+  const regEnd = playoffStart - 1;
+  const nPlay = Math.min(S.rosters.length, Number(st.playoff_teams) || 6);
+  const pow2 = 2 ** Math.ceil(Math.log2(Math.max(2, nPlay)));
+  const byes = nPlay === pow2 ? 0 : Math.min(Math.floor(nPlay / 2), pow2 - nPlay);
+  const lastScored = Number(st.last_scored_leg) || Math.max(0, (Number(state.week) || 1) - 1);
+  const weeks = [];
+  if (!S.seasonOver) for (let w = Math.max(1, lastScored + 1); w <= regEnd; w++) weeks.push(w);
+  const po = { weeks, regEnd, nPlay, byes, median: Number(st.league_average_match) === 1, divisions: Number(st.divisions) || 0, games: {}, wk: {}, locks: {}, ready: false };
+  S.po = po;
+  const lists = await Promise.all(weeks.map((w) => getJSON(`${API}/league/${leagueId}/matchups/${w}`).catch(() => [])));
+  weeks.forEach((w, i) => {
+    const byId = {};
+    for (const m of lists[i] || []) if (m && m.matchup_id != null) (byId[m.matchup_id] = byId[m.matchup_id] || []).push(m.roster_id);
+    po.games[w] = Object.values(byId).filter((g) => g.length === 2);
+    // each player's projected points for that week, with recent form applied
+    const data = S.weeksData[w - S.fromWeek], pts = {};
+    if (data) for (const pid in data) { const pos = posOf(pid); if (pos) pts[pid] = scoreStats(data[pid], S.scoring, pos) * ((S.form[pid] && S.form[pid].factor) || 1); }
+    po.wk[w] = data ? pts : null;
+  });
+  po.weeks = weeks.filter((w) => po.games[w].length);
+  po.schedErr = weeks.length > 0 && !po.weeks.length;
+  po.base = runPlayoffs();
+  po.ready = true;
+  if (S.page === "po") renderPlayoffs();
+  if (S.page === "trade") renderTrade();
+}
+// Projected starting-lineup score for each team in each remaining week; override swaps in other rosters
+function poMeans(override) {
+  const po = S.po, out = {};
+  for (const w of po.weeks) {
+    out[w] = {};
+    const wk = po.wk[w];
+    const ppw = wk ? (pid) => wk[pid] || 0 : ppgOf;
+    for (const r of S.rosters) {
+      const pids = (override && override[r.roster_id]) || (r.players || []).filter((pid) => S.players[pid]);
+      out[w][r.roster_id] = bestLineup(pids, S.slots, ppw, posOf).total;
+    }
+  }
+  return out;
+}
+function runPlayoffs(override, sims) {
+  const N = sims || PO_SIMS;
+  const po = S.po, teams = S.rosters.map((r) => r.roster_id), n = teams.length;
+  const idx = {}; teams.forEach((rid, i) => { idx[rid] = i; });
+  const means = poMeans(override);
+  // Flatten everything the loop touches into typed arrays so 5,000 seasons run quickly on a phone
+  const nw = po.weeks.length;
+  const mu = new Float64Array(nw * n), sd = new Float64Array(nw * n);
+  const ga = [], gb = [], gl = [], gw = [];
+  po.weeks.forEach((w, wi) => {
+    for (let i = 0; i < n; i++) { const m = means[w][teams[i]] || 0; mu[wi * n + i] = m; sd[wi * n + i] = sdOf(m); }
+    po.games[w].forEach((g, gi) => {
+      const a = idx[g[0]], b = idx[g[1]];
+      if (a == null || b == null) return;
+      const lock = po.locks[`${w}:${gi}`];
+      ga.push(a); gb.push(b); gw.push(wi); gl.push(lock == null ? -1 : String(lock) === String(g[0]) ? 0 : 1);
+    });
+  });
+  const ng = ga.length;
+  const baseW = new Float64Array(n), basePF = new Float64Array(n);
+  S.rosters.forEach((r, i) => { const s = r.settings || {}; baseW[i] = (s.wins || 0) + 0.5 * (s.ties || 0); basePF[i] = (s.fpts || 0) + (s.fpts_decimal || 0) / 100; });
+  const playoff = new Float64Array(n), bye = new Float64Array(n), top = new Float64Array(n), winSum = new Float64Array(n);
+  const rng = mulberry32(20261125);   // fixed seed: same random draws before and after a trade
+  const W = new Float64Array(n), PF = new Float64Array(n), sc = new Float64Array(nw * n), tmp = new Float64Array(n);
+  const order = new Int32Array(n), half = Math.floor(n / 2) - 1;
+  const cmp = (x, y) => W[y] - W[x] || PF[y] - PF[x];
+  for (let s = 0; s < N; s++) {
+    W.set(baseW); PF.set(basePF);
+    for (let k = 0; k < nw * n; k++) {
+      let u = rng(); if (u === 0) u = 1e-12;
+      const v = mu[k] + sd[k] * Math.sqrt(-2 * Math.log(u)) * Math.cos(6.283185307179586 * rng());
+      sc[k] = v > 0 ? v : 0; PF[k % n] += sc[k];
+    }
+    for (let g = 0; g < ng; g++) {
+      const o = gw[g] * n, a = ga[g], b = gb[g];
+      W[(gl[g] === 0 || (gl[g] < 0 && sc[o + a] > sc[o + b])) ? a : b] += 1;
+    }
+    if (po.median) {   // extra game against the league median each week
+      for (let wi = 0; wi < nw; wi++) {
+        for (let i = 0; i < n; i++) tmp[i] = sc[wi * n + i];
+        tmp.sort(); const cut = tmp[n - 1 - half];
+        for (let i = 0; i < n; i++) if (sc[wi * n + i] >= cut) W[i] += 1;
+      }
+    }
+    for (let i = 0; i < n; i++) order[i] = i;
+    order.sort(cmp);
+    for (let k = 0; k < n; k++) { const t = order[k]; if (k < po.nPlay) playoff[t]++; if (k < po.byes) bye[t]++; if (k === 0) top[t]++; }
+    for (let i = 0; i < n; i++) winSum[i] += W[i];
+  }
+  const res = {};
+  teams.forEach((rid, i) => { res[rid] = { playoff: playoff[i] / N, bye: bye[i] / N, top: top[i] / N, wins: winSum[i] / N }; });
+  return { res, means };
+}
+const pct = (x) => (x >= 0.995 ? ">99%" : x > 0 && x < 0.005 ? "<1%" : `${Math.round(x * 100)}%`);
+
+function renderPlayoffs() {
+  const po = S.po;
+  if (!po) { $("poHint").textContent = "Loading the schedule…"; return; }
+  if (S.seasonOver || !po.weeks.length) {
+    $("poMeta").textContent = "";
+    $("poHint").textContent = S.seasonOver ? "The season is over, so there are no playoff odds to show."
+      : po.schedErr ? "Couldn't load the remaining schedule from Sleeper. Reload the page to try again. Standings below are as of now."
+      : "The regular season is over. Seeds are set by the final standings.";
+  }
+  const res = po.base ? po.base.res : {};
+  const myId = S.myRosterId != null ? S.myRosterId : Number($("teamA").value);
+  const rec = (r) => { const s = r.settings || {}; return `${s.wins || 0}-${s.losses || 0}${s.ties ? "-" + s.ties : ""}`; };
+  const pf = (r) => { const s = r.settings || {}; return (s.fpts || 0) + (s.fpts_decimal || 0) / 100; };
+  const now = S.rosters.slice().sort((a, b) => ((b.settings || {}).wins || 0) - ((a.settings || {}).wins || 0) || pf(b) - pf(a));
+  const seedNow = {}; now.forEach((r, i) => { seedNow[r.roster_id] = i + 1; });
+  const rows = S.rosters.slice().sort((a, b) => ((res[b.roster_id] || {}).playoff || 0) - ((res[a.roster_id] || {}).playoff || 0) || seedNow[a.roster_id] - seedNow[b.roster_id]);
+  const locked = Object.keys(po.locks).length;
+  if (po.weeks.length) {
+    $("poMeta").textContent = `Weeks ${po.weeks[0]} to ${po.weeks[po.weeks.length - 1]} · top ${po.nPlay} make it${po.byes ? ` · top ${po.byes} get a bye` : ""}`;
+    $("poHint").textContent = `${PO_SIMS.toLocaleString()} simulated seasons. Seeded by wins, then points for.` +
+      (po.median ? " Includes a weekly game against the league median." : "") +
+      (po.divisions > 1 ? " Divisions aren't modeled; seeds use overall record." : "") +
+      (locked ? ` Using ${plural(locked, "locked result")}.` : "");
+  }
+  let html = `<thead><tr><th>Now</th><th>Team</th><th class="n">Record</th><th class="n">Points for</th><th class="n">Proj. wins</th><th class="n">Playoffs</th>${po.byes ? `<th class="n">Bye</th>` : ""}<th class="n">#1 seed</th></tr></thead><tbody>`;
+  rows.forEach((r, i) => {
+    const x = res[r.roster_id] || { playoff: seedNow[r.roster_id] <= po.nPlay ? 1 : 0, bye: 0, top: 0, wins: (r.settings || {}).wins || 0 };
+    html += `<tr class="${r.roster_id === myId ? "mine" : ""}${i === po.nPlay - 1 ? " cut" : ""}">
+      <td class="rnk">${seedNow[r.roster_id]}</td>
+      <td class="pl"><b>${esc(teamName(r))}</b></td>
+      <td class="n">${rec(r)}</td>
+      <td class="n">${fmt1(pf(r))}</td>
+      <td class="n">${fmt1(x.wins)}</td>
+      <td class="n"><span class="pct">${pct(x.playoff)}</span><div class="vbar"><i style="width:${Math.round(x.playoff * 100)}%"></i></div></td>
+      ${po.byes ? `<td class="n">${pct(x.bye)}</td>` : ""}
+      <td class="n">${pct(x.top)}</td>
+    </tr>`;
+  });
+  $("poTable").innerHTML = html + "</tbody>";
+  // week tabs and games
+  if (!po.weeks.includes(S.poWeek)) S.poWeek = po.weeks[0];
+  $("poWeeks").innerHTML = po.weeks.map((w) => `<button type="button" data-w="${w}" aria-pressed="${w === S.poWeek}">Wk ${w}</button>`).join("");
+  $("poReset").disabled = !locked;
+  $("poLockMeta").textContent = locked ? plural(locked, "result") + " locked" : "";
+  const means = po.base ? po.base.means : {};
+  $("poGames").innerHTML = (po.games[S.poWeek] || []).map((g, gi) => {
+    const key = `${S.poWeek}:${gi}`, lock = po.locks[key];
+    const ma = (means[S.poWeek] || {})[g[0]] || 0, mb = (means[S.poWeek] || {})[g[1]] || 0;
+    const pa = winChance(ma, mb);
+    const side = (rid, m, p) => {
+      const on = lock != null && String(lock) === String(rid), off = lock != null && !on;
+      return `<button type="button" data-key="${key}" data-rid="${rid}" aria-pressed="${on}" class="${off ? "lost" : ""}${rid === myId ? " mine" : ""}">
+        <span class="gn">${esc(teamName(rosterById(rid)))}</span><span class="gs">${fmt1(m)}</span><span class="gp">${on ? "Win" : off ? "Loss" : pct(p)}</span></button>`;
+    };
+    return `<div class="game">${side(g[0], ma, pa)}${side(g[1], mb, 1 - pa)}</div>`;
+  }).join("") || `<div class="empty" style="padding:0 2px">No matchups left in the regular season.</div>`;
 }
 
 // ---- Draft picks ----
@@ -1156,7 +1359,7 @@ function lineupImpact(r, sends, gets) {
     for (let i = 0; i < over && i < bench.length; i++) drops.push(bench[i]);
     after = after.filter((pid) => !drops.includes(pid));
   }
-  return { before: b, after: bestLineup(after, S.slots, ppgOf, posOf).total, drops };
+  return { before: b, after: bestLineup(after, S.slots, ppgOf, posOf).total, drops, pids: after };
 }
 function keeperImpact(r, sends, gets) {
   const before = [...(r.players || []), ...(r.reserve || [])];
@@ -1247,6 +1450,16 @@ function renderTrade() {
     const kA = keeperImpact(rA, aSends, bSends), kB = keeperImpact(rB, bSends, aSends);
     rows += `<tr><td>Best ${KEEPERS} keepers</td>${cell(kA, fmt0, SCALE / 200)}${cell(kB, fmt0, SCALE / 200)}</tr>`;
   }
+  if (S.po && S.po.ready && S.po.weeks.length && !S.seasonOver && (aSends.some((x) => !isPick(x)) || bSends.some((x) => !isPick(x)))) {
+    const key = JSON.stringify([rA.roster_id, iA.pids, rB.roster_id, iB.pids, S.po.locks]);
+    const lockKey = JSON.stringify(S.po.locks);
+    if (!S.po.quick || S.po.quick.key !== lockKey) S.po.quick = { key: lockKey, res: runPlayoffs(null, PO_TRADE_SIMS).res };
+    if (!S.po.tradeCache || S.po.tradeCache.key !== key) S.po.tradeCache = { key, res: runPlayoffs({ [rA.roster_id]: iA.pids, [rB.roster_id]: iB.pids }, PO_TRADE_SIMS).res };
+    const after = S.po.tradeCache.res, before = S.po.quick.res;
+    const pcell = (rid) => { const b = before[rid].playoff, a = after[rid].playoff, d = Math.round((a - b) * 100);
+      return `<td><span class="${d > 0 ? "up" : d < 0 ? "down" : ""}">${d === 0 ? "No change" : `${d > 0 ? "+" : ""}${d}%`}</span><span class="dl">${pct(b)} → ${pct(a)}</span></td>`; };
+    rows += `<tr><td>Playoff odds</td>${pcell(rA.roster_id)}${pcell(rB.roster_id)}</tr>`;
+  }
   $("impact").innerHTML = rows + "</tbody>";
 
   // Balancers
@@ -1275,6 +1488,7 @@ function renderTrade() {
 
 function renderAll() {
   if (S.page === "rank") { renderRankings(); return; }
+  if (S.page === "po") { renderPlayoffs(); return; }
   renderRoster("A"); renderRoster("B"); renderTrade();
 }
 
@@ -1560,7 +1774,7 @@ function applyShared() {
   const sh = S.shared;
   if (!sh || String(sh.l) !== String(S.leagueId)) return;
   if (sh.m) setMode(sh.m);
-  if (sh.pg) S.page = sh.pg === "rank" ? "rank" : "trade";
+  if (sh.pg) S.page = ["rank", "po"].includes(sh.pg) ? sh.pg : "trade";
   if (sh.rk) S.rkPos = sh.rk;
   if (sh.src) setSrc(sh.src);
   if (sh.st) setStar(String(sh.st));
@@ -1606,12 +1820,13 @@ async function refreshIfStale() {
 }
 
 function setPage(pg) {
-  S.page = pg === "rank" ? "rank" : "trade";
+  S.page = ["rank", "po"].includes(pg) ? pg : "trade";
   for (const b of $("pageTabs").querySelectorAll("button")) b.setAttribute("aria-pressed", String(b.dataset.page === S.page));
   const loaded = !!S.league;
   $("trade").hidden = !loaded || S.page !== "trade";
   $("rosters").hidden = !loaded || S.page !== "trade";
   $("rankView").hidden = !loaded || S.page !== "rank";
+  $("poView").hidden = !loaded || S.page !== "po";
   if (loaded) renderAll();
 }
 function showPickNotice() {
@@ -1762,6 +1977,15 @@ function init() {
   });
   $("shKeep").addEventListener("click", () => { S.shared = null; $("shareBanner").hidden = true; });
   initDrag();
+  $("poWeeks").addEventListener("click", (e) => { const b = e.target.closest("[data-w]"); if (!b) return; S.poWeek = Number(b.dataset.w); renderPlayoffs(); });
+  $("poGames").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-key]"); if (!b || !S.po || !S.po.ready) return;
+    const k = b.dataset.key;
+    if (String(S.po.locks[k]) === b.dataset.rid) delete S.po.locks[k]; else S.po.locks[k] = Number(b.dataset.rid);
+    S.po.base = runPlayoffs(); renderPlayoffs();
+    const again = document.querySelector(`#poGames [data-key="${k}"][data-rid="${b.dataset.rid}"]`); if (again) again.focus();
+  });
+  $("poReset").addEventListener("click", () => { if (!S.po) return; S.po.locks = {}; S.po.base = runPlayoffs(); renderPlayoffs(); });
   $("pickOk").addEventListener("click", closePickNotice);
   $("pickModal").addEventListener("click", (e) => { if (e.target === $("pickModal")) closePickNotice(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("pickModal").hidden) closePickNotice(); });
